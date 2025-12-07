@@ -33,7 +33,8 @@ void gpio_irq_handler(uint gpio, uint32_t events)
 }
 
 // Função para enviar dados do display via DMA
-// Utiliza DMA para transferir o buffer do display para o I2C, reduzindo a carga da CPU
+// Implementação real de DMA para transferir o buffer do display para o I2C
+// Baseada no exemplo DMA_PWM_LED.c, adaptada para I2C
 void ssd1306_send_data_dma(ssd1306_t *ssd, int dma_chan)
 {
     // Configura os comandos de endereçamento antes da transferência DMA
@@ -44,12 +45,73 @@ void ssd1306_send_data_dma(ssd1306_t *ssd, int dma_chan)
     ssd1306_command(ssd, 0);
     ssd1306_command(ssd, ssd->pages - 1);
     
-    // Usa a função original que funciona corretamente
-    // A implementação completa de DMA com I2C requer sincronização complexa
-    // entre o início da transferência I2C e o DMA, que pode causar problemas
-    // Esta função mantém a estrutura para futura implementação completa de DMA
-    (void)dma_chan; // Evita warning de variável não usada
-    ssd1306_send_data(ssd);
+    // Obtém o hardware I2C
+    i2c_hw_t *i2c_hw = i2c_get_hw(I2C_PORT_DISP);
+    
+    // Limpa qualquer estado anterior do DMA
+    dma_channel_abort(dma_chan);
+    
+    // Habilita DMA no I2C para transmissão
+    i2c_hw->dma_cr = I2C_IC_DMA_CR_TDMAE_BITS;
+    
+    // Configura o endereço do dispositivo I2C
+    i2c_hw->tar = ssd->address;
+    
+    // Garante que o I2C está habilitado e pronto
+    i2c_hw->enable = 1;
+    
+    // Aguarda que o I2C esteja inativo
+    while (i2c_hw->status & I2C_IC_STATUS_ACTIVITY_BITS);
+    
+    // Configura o canal DMA para transferir o buffer completo
+    dma_channel_config c = dma_channel_get_default_config(dma_chan);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);  // 8 bits por transferência
+    channel_config_set_dreq(&c, i2c_get_dreq(I2C_PORT_DISP, true)); // Sincronização com I2C TX
+    channel_config_set_read_increment(&c, true);   // Incrementa endereço de leitura (buffer)
+    channel_config_set_write_increment(&c, false); // Não incrementa endereço de escrita (registrador I2C)
+    
+    // Configura DMA: transfere do buffer do display para o registrador data_cmd do I2C
+    // O primeiro byte (0x40) será enviado manualmente com START
+    // O DMA transferirá todos os bytes exceto o primeiro e o último
+    // O último byte será enviado manualmente com STOP
+    uint32_t bytes_to_transfer = ssd->bufsize - 2; // Todos exceto primeiro e último
+    
+    if (bytes_to_transfer > 0) {
+        dma_channel_configure(
+            dma_chan,
+            &c,
+            &i2c_hw->data_cmd,        // Destino: registrador de dados/comando do I2C
+            &ssd->ram_buffer[1],      // Origem: buffer do display (pula o primeiro byte)
+            bytes_to_transfer,        // Número de bytes a transferir via DMA
+            false                      // Não inicia ainda
+        );
+    }
+    
+    // Inicia a transferência I2C manualmente
+    // Envia o primeiro byte (0x40) com START (bit 8 = 1)
+    while (!(i2c_hw->status & I2C_IC_STATUS_TFNF_BITS)); // Aguarda FIFO ter espaço
+    
+    // Envia o primeiro byte com START
+    i2c_hw->data_cmd = ssd->ram_buffer[0] | (1 << 8); // START + primeiro byte (0x40)
+    
+    // Se há bytes para transferir via DMA, inicia a transferência
+    if (bytes_to_transfer > 0) {
+        // Aguarda que a FIFO tenha espaço antes de iniciar DMA
+        while (!(i2c_hw->status & I2C_IC_STATUS_TFNF_BITS));
+        
+        // Inicia a transferência DMA
+        dma_channel_start(dma_chan);
+        
+        // Aguarda a conclusão da transferência DMA
+        dma_channel_wait_for_finish_blocking(dma_chan);
+    }
+    
+    // Envia o último byte com STOP (bit 9 = 1)
+    while (!(i2c_hw->status & I2C_IC_STATUS_TFNF_BITS));
+    i2c_hw->data_cmd = ssd->ram_buffer[ssd->bufsize - 1] | (1 << 9); // STOP + último byte
+    
+    // Aguarda que o I2C termine completamente a transferência
+    while (i2c_hw->status & I2C_IC_STATUS_ACTIVITY_BITS);
 }
 
 int main()
