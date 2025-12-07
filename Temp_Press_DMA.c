@@ -198,16 +198,14 @@ int main()
         }
 
         // Prepara strings para exibição
-        sprintf(str_tmp, "%.1fC", temp_media);
-        sprintf(str_umi, "%.1f%%", umid_media);
+        sprintf(str_tmp, "Temp: %.1fC", temp_media);
+        sprintf(str_umi, "Umid: %.1f%%", umid_media);
     
         // Atualiza o display com informações simplificadas
         ssd1306_fill(&ssd, false);                        // Limpa o display
         ssd1306_draw_string(&ssd, "DMA", 50, 6);          // Título
-        ssd1306_draw_string(&ssd, "Temperatura:", 5, 25); // Label temperatura
-        ssd1306_draw_string(&ssd, str_tmp, 5, 35);        // Valor temperatura
-        ssd1306_draw_string(&ssd, "Umidade:", 5, 45);     // Label umidade
-        ssd1306_draw_string(&ssd, str_umi, 5, 55);        // Valor umidade
+        ssd1306_draw_string(&ssd, str_tmp, 5, 30);        // Temp: valor (uma linha)
+        ssd1306_draw_string(&ssd, str_umi, 5, 45);        // Umid: valor (outra linha)
         ssd1306_send_data(&ssd);                          // Atualiza o display
 
         sleep_ms(500);
