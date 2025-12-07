@@ -24,11 +24,7 @@
 #define DMA_CHANNEL_TEMP 0          // Canal DMA para temperatura
 #define DMA_CHANNEL_UMID 1          // Canal DMA para umidade
 
-// Função para calcular a altitude a partir da pressão atmosférica
-double calculate_altitude(double pressure)
-{
-    return 44330.0 * (1.0 - pow(pressure / SEA_LEVEL_PRESSURE, 0.1903));
-}
+
 
 // Trecho para modo BOOTSEL com botão B
 #include "pico/bootrom.h"
