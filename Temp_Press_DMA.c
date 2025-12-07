@@ -7,6 +7,7 @@
 #include "ssd1306.h"
 #include "font.h"
 #include <math.h>
+#include <string.h>
 
 #define I2C_PORT i2c0               // i2c0 pinos 0 e 1, i2c1 pinos 2 e 3
 #define I2C_SDA 0                   // 0 ou 2
@@ -17,6 +18,11 @@
 #define I2C_SDA_DISP 14
 #define I2C_SCL_DISP 15
 #define endereco 0x3C
+
+// Configuração de buffers DMA
+#define BUFFER_SIZE 32              // Tamanho do buffer circular para leituras
+#define DMA_CHANNEL_TEMP 0          // Canal DMA para temperatura
+#define DMA_CHANNEL_UMID 1          // Canal DMA para umidade
 
 // Função para calcular a altitude a partir da pressão atmosférica
 double calculate_altitude(double pressure)
@@ -30,26 +36,6 @@ double calculate_altitude(double pressure)
 void gpio_irq_handler(uint gpio, uint32_t events)
 {
     reset_usb_boot(0, 0);
-}
-
-// Função para enviar dados do display via DMA
-// Utiliza DMA para transferir o buffer do display para o I2C, reduzindo a carga da CPU
-void ssd1306_send_data_dma(ssd1306_t *ssd, int dma_chan)
-{
-    // Configura os comandos de endereçamento antes da transferência DMA
-    ssd1306_command(ssd, SET_COL_ADDR);
-    ssd1306_command(ssd, 0);
-    ssd1306_command(ssd, ssd->width - 1);
-    ssd1306_command(ssd, SET_PAGE_ADDR);
-    ssd1306_command(ssd, 0);
-    ssd1306_command(ssd, ssd->pages - 1);
-    
-    // Usa a função original que funciona corretamente
-    // A implementação completa de DMA com I2C requer sincronização complexa
-    // entre o início da transferência I2C e o DMA, que pode causar problemas
-    // Esta função mantém a estrutura para futura implementação completa de DMA
-    (void)dma_chan; // Evita warning de variável não usada
-    ssd1306_send_data(ssd);
 }
 
 int main()
@@ -91,94 +77,138 @@ int main()
     bmp280_init(I2C_PORT);
     struct bmp280_calib_param params;
     bmp280_get_calib_params(I2C_PORT, &params);
-    
-    // Pequeno delay para garantir que o BMP280 esteja pronto
-    sleep_ms(100);
 
     // Inicializa o AHT20
     aht20_reset(I2C_PORT);
-    sleep_ms(20); // Delay após reset
     aht20_init(I2C_PORT);
-    sleep_ms(100); // Delay após inicialização para garantir que o sensor esteja pronto
 
     // Estrutura para armazenar os dados do sensor
     AHT20_Data data;
     int32_t raw_temp_bmp;
     int32_t raw_pressure;
 
-    // Buffers para strings do display
-    char str_temp[15];   // Buffer para temperatura
-    char str_press[15];  // Buffer para umidade
-    char str_temp_full[25];  // Buffer para string completa de temperatura
-    char str_umid_full[25];  // Buffer para string completa de umidade
+    // Buffers DMA para armazenar múltiplas leituras (buffer circular)
+    float temp_buffer[BUFFER_SIZE];      // Buffer de temperatura
+    float umid_buffer[BUFFER_SIZE];      // Buffer de umidade
+    uint8_t buffer_index = 0;            // Índice atual do buffer circular
+    uint8_t buffer_count = 0;            // Contador de leituras válidas
+    
+    // Buffers de processamento DMA
+    float temp_processed[BUFFER_SIZE];   // Buffer processado de temperatura
+    float umid_processed[BUFFER_SIZE];   // Buffer processado de umidade
+    
+    // Valores médios para exibição
+    float temp_media = 0.0f;
+    float umid_media = 0.0f;
+    
+    // Inicializa buffers com zero
+    memset(temp_buffer, 0, sizeof(temp_buffer));
+    memset(umid_buffer, 0, sizeof(umid_buffer));
+    memset(temp_processed, 0, sizeof(temp_processed));
+    memset(umid_processed, 0, sizeof(umid_processed));
 
-    // Configuração do DMA para o display
-    int dma_chan_display = dma_claim_unused_channel(true);
-    
-    // Inicializa os buffers de string
-    str_temp[0] = '\0';
-    str_press[0] = '\0';
-    
+    // Configuração dos canais DMA
+    int dma_chan_temp = dma_claim_unused_channel(true);
+    int dma_chan_umid = dma_claim_unused_channel(true);
+
+    // Configuração do canal DMA para temperatura
+    dma_channel_config c_temp = dma_channel_get_default_config(dma_chan_temp);
+    channel_config_set_transfer_data_size(&c_temp, DMA_SIZE_32);  // float = 32 bits
+    channel_config_set_read_increment(&c_temp, true);
+    channel_config_set_write_increment(&c_temp, true);
+    channel_config_set_dreq(&c_temp, DREQ_FORCE);  // Sempre ativo
+
+    // Configuração do canal DMA para umidade
+    dma_channel_config c_umid = dma_channel_get_default_config(dma_chan_umid);
+    channel_config_set_transfer_data_size(&c_umid, DMA_SIZE_32);  // float = 32 bits
+    channel_config_set_read_increment(&c_umid, true);
+    channel_config_set_write_increment(&c_umid, true);
+    channel_config_set_dreq(&c_umid, DREQ_FORCE);  // Sempre ativo
+
+    // Configura os canais DMA (ainda não iniciados)
+    dma_channel_configure(dma_chan_temp, &c_temp,
+        temp_processed,    // Destino
+        temp_buffer,       // Origem
+        BUFFER_SIZE,       // Número de transferências
+        false              // Não inicia ainda
+    );
+
+    dma_channel_configure(dma_chan_umid, &c_umid,
+        umid_processed,    // Destino
+        umid_buffer,       // Origem
+        BUFFER_SIZE,       // Número de transferências
+        false              // Não inicia ainda
+    );
+
+    char str_tmp[10];  // Buffer para temperatura
+    char str_umi[10];  // Buffer para umidade
     while (1)
     {
-        // Leitura do BMP280
+        // Leitura do BMP280 (usado apenas para logs, não exibido no display)
         bmp280_read_raw(I2C_PORT, &raw_temp_bmp, &raw_pressure);
         int32_t temperature = bmp280_convert_temp(raw_temp_bmp, &params);
         int32_t pressure = bmp280_convert_pressure(raw_pressure, raw_temp_bmp, &params);
 
-        // Cálculo da altitude
-        double altitude = calculate_altitude(pressure);
-
-        printf("Pressao = %.3f kPa\n", pressure / 1000.0);
-        printf("Temperatura BMP: = %.2f C\n", temperature / 100.0);
-        printf("Altitude estimada: %.2f m\n", altitude);
-
-        // Leitura do AHT20 (uma única leitura para usar no printf e no display)
-        bool aht20_ok = aht20_read(I2C_PORT, &data);
-        if (aht20_ok)
+        // Leitura do AHT20
+        if (aht20_read(I2C_PORT, &data))
         {
-            printf("Temperatura AHT: %.2f C\n", data.temperature);
-            printf("Umidade: %.2f %%\n\n\n", data.humidity);
+            // Armazena leituras nos buffers DMA (buffer circular)
+            temp_buffer[buffer_index] = data.temperature;
+            umid_buffer[buffer_index] = data.humidity;
             
-            // Formata os valores para exibição usando dados do AHT20
-            sprintf(str_temp, "%.1fC", data.temperature);      // Temperatura do AHT20
-            sprintf(str_press, "%.1f%%", data.humidity);       // Umidade do AHT20
+            // Incrementa o índice do buffer circular
+            buffer_index = (buffer_index + 1) % BUFFER_SIZE;
+            
+            // Incrementa contador até encher o buffer
+            if (buffer_count < BUFFER_SIZE) {
+                buffer_count++;
+            }
+            
+            // Usa DMA para transferir dados do buffer circular para buffer de processamento
+            // Isso demonstra o uso de DMA para transferência eficiente de dados em alta velocidade
+            // minimizando a carga da CPU durante a cópia de memória
+            dma_channel_set_read_addr(dma_chan_temp, temp_buffer, false);
+            dma_channel_set_write_addr(dma_chan_temp, temp_processed, false);
+            dma_channel_set_trans_count(dma_chan_temp, BUFFER_SIZE, true);
+            
+            dma_channel_set_read_addr(dma_chan_umid, umid_buffer, false);
+            dma_channel_set_write_addr(dma_chan_umid, umid_processed, false);
+            dma_channel_set_trans_count(dma_chan_umid, BUFFER_SIZE, true);
+            
+            // Aguarda a conclusão da transferência DMA (CPU livre durante a transferência)
+            dma_channel_wait_for_finish_blocking(dma_chan_temp);
+            dma_channel_wait_for_finish_blocking(dma_chan_umid);
+            
+            // Calcula média dos valores válidos (processamento após DMA)
+            temp_media = 0.0f;
+            umid_media = 0.0f;
+            for (int i = 0; i < buffer_count; i++) {
+                temp_media += temp_processed[i];
+                umid_media += umid_processed[i];
+            }
+            temp_media /= buffer_count;
+            umid_media /= buffer_count;
+            
+            printf("Temperatura: %.2f C (DMA)\n", temp_media);
+            printf("Umidade: %.2f %% (DMA)\n\n", umid_media);
         }
         else
         {
-            printf("Erro na leitura do AHT20!\n\n\n");
-            // Fallback se a leitura falhar
-            sprintf(str_temp, "N/A");
-            sprintf(str_press, "N/A");
+            printf("Erro na leitura do AHT20!\n\n");
         }
-        
-        // Cria strings completas para exibição na mesma linha
-        if (aht20_ok)
-        {
-            sprintf(str_temp_full, "Temp: %s", str_temp);        // "Temp: 28.1C"
-            sprintf(str_umid_full, "Umidade: %s", str_press);   // "Umidade: 63.1%"
-        }
-        else
-        {
-            sprintf(str_temp_full, "Temp: N/A");
-            sprintf(str_umid_full, "Umidade: N/A");
-        }
-        
-        // Debug: verifica se as strings estão sendo formatadas corretamente
-        printf("Display - String temp: [%s]\n", str_temp_full);
-        printf("Display - String umid: [%s]\n", str_umid_full);
+
+        // Prepara strings para exibição
+        sprintf(str_tmp, "%.1fC", temp_media);
+        sprintf(str_umi, "%.1f%%", umid_media);
     
-        // Atualiza o conteúdo do display (interface simplificada)
-        ssd1306_fill(&ssd, false);                              // Limpa o display
-        ssd1306_draw_string(&ssd, "DMA", 50, 0);                // Título (Y=0)
-        ssd1306_line(&ssd, 0, 16, 127, 16, true);              // Linha separadora (Y=16)
-        ssd1306_draw_string(&ssd, str_temp_full, 10, 24);      // "Temp: 28.1C" (Y=24)
-        ssd1306_line(&ssd, 0, 32, 127, 32, true);              // Linha separadora (Y=32)
-        ssd1306_draw_string(&ssd, str_umid_full, 10, 40);      // "Umidade: 63.1%" (Y=40)
-        
-        // Envia dados do display via DMA (reduz carga da CPU)
-        // Por enquanto, usa a função original para garantir que funcione
-        ssd1306_send_data(&ssd);
+        // Atualiza o display com informações simplificadas
+        ssd1306_fill(&ssd, false);                        // Limpa o display
+        ssd1306_draw_string(&ssd, "DMA", 50, 6);          // Título
+        ssd1306_draw_string(&ssd, "Temperatura:", 5, 25); // Label temperatura
+        ssd1306_draw_string(&ssd, str_tmp, 5, 35);        // Valor temperatura
+        ssd1306_draw_string(&ssd, "Umidade:", 5, 45);     // Label umidade
+        ssd1306_draw_string(&ssd, str_umi, 5, 55);        // Valor umidade
+        ssd1306_send_data(&ssd);                          // Atualiza o display
 
         sleep_ms(500);
     }
